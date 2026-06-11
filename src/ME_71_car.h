@@ -1,6 +1,7 @@
 #ifndef ME71_CAR
 #define ME71_CAR
 #include <Arduino.h>
+#include <Wire.h>
 #include <array>
 #include <string>
 #include <hd44780.h>
