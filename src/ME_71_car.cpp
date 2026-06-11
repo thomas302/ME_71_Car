@@ -2,12 +2,59 @@
 #include <Wire.h>
 #include "Adafruit_VL53L0X.h"
 #include <hd44780.h>
-#include <hd44780ioClass/hd44780_I2Cexp.h> 
+#include <hd44780ioClass/hd44780_I2Cexp.h>
 
-Car::Car(){
+// ----------------------------------------------------------------
+// Internal state (hidden from students)
+// ----------------------------------------------------------------
+
+// LCD
+static hd44780_I2Cexp  _lcd;
+static SemaphoreHandle_t _lcdMutex;
+static TaskHandle_t      _lcdTaskHandle;
+
+struct LineState {
+    std::string   text;
+    int           offset;
+    unsigned long lastScroll;
+};
+static LineState _lineState[LCD_LINES];
+
+// TOF
+static Adafruit_VL53L0X _tof[3];
+
+// IR
+static std::array<int, 3> _irValues;
+static SemaphoreHandle_t  _irMutex;
+static TaskHandle_t       _irTaskHandle;
+
+// RGB
+static Adafruit_NeoPixel _rgb;
+
+// Motors
+static int  _r_speed = 0;
+static int  _l_speed = 0;
+static bool _r_dir   = false;
+static bool _l_dir   = false;
+
+// ----------------------------------------------------------------
+// Forward declarations of internal helpers
+// ----------------------------------------------------------------
+static void init_lcd();
+static void init_tof();
+static void init_ir();
+static void init_rgb();
+static void init_motors();
+static void update_motors();
+static void lcd_task(void* pvParameters);
+static void ir_task(void* pvParameters);
+
+// ----------------------------------------------------------------
+// Public: car_init
+// ----------------------------------------------------------------
+void car_init() {
     Serial.begin(115200);
 
-    // Set pin modes, declare interfaces
     pinMode(MTR_R_ONE, OUTPUT);
     pinMode(MTR_R_TWO, OUTPUT);
     pinMode(MTR_L_ONE, OUTPUT);
@@ -22,18 +69,18 @@ Car::Car(){
     pinMode(TOF_XSHUT[2], OUTPUT);
 
     Wire.begin(I2C_SDA, I2C_SCL);
-    delay(100); 
+    delay(100);
 
     init_lcd();
-    delay(100); 
+    delay(100);
     print_to_lcd("LCD Initialized", 0);
 
     init_tof();
-    print_to_lcd("TOF Sensors Initialized", 0);
-    delay(100); 
+    print_to_lcd("TOF Initialized", 0);
+    delay(100);
 
     init_ir();
-    print_to_lcd("IR Sensors Initialized", 0);
+    print_to_lcd("IR Initialized", 0);
     delay(100);
 
     init_rgb();
@@ -41,37 +88,19 @@ Car::Car(){
     delay(100);
 
     init_motors();
-    print_to_lcd("Motor Initialized", 0);
+    print_to_lcd("Motors Initialized", 0);
     delay(100);
-
-
 }
 
-void Car::init_lcd(){
-    int status = _lcd.begin(LCD_COLS, LCD_LINES);
-    _lcdMutex = xSemaphoreCreateMutex();
-
-    xTaskCreatePinnedToCore(
-        lcd_task,        // task function
-        "lcd_task",      // name (for debugging)
-        2048,            // stack size in bytes
-        this,            // pass Car instance as parameter
-        1,               // priority
-        &_lcdTaskHandle, // handle
-        0                // pin to Core 0
-    );
-
-}
-
-void Car::lcd_task(void* pvParameters) {
-    Car* car = static_cast<Car*>(pvParameters);
-    
+// ----------------------------------------------------------------
+// LCD
+// ----------------------------------------------------------------
+static void lcd_task(void* pvParameters) {
     for (;;) {
         unsigned long now = millis();
-        
         for (int line = 0; line < LCD_LINES; line++) {
-            if (xSemaphoreTake(car->_lcdMutex, 0)) {  // non-blocking
-                LineState& ls = car->_lineState[line];
+            if (xSemaphoreTake(_lcdMutex, 0)) {
+                LineState& ls = _lineState[line];
                 if ((int)ls.text.size() > LCD_COLS &&
                     now - ls.lastScroll >= SCROLL_DELAY_MS) {
 
@@ -80,27 +109,31 @@ void Car::lcd_task(void* pvParameters) {
                     if (ls.offset > (int)ls.text.size() - LCD_COLS)
                         ls.offset = 0;
 
-                    car->_lcd.setCursor(0, line);
+                    _lcd.setCursor(0, line);
                     std::string view = ls.text.substr(ls.offset, LCD_COLS);
                     while ((int)view.size() < LCD_COLS) view += ' ';
-                    car->_lcd.print(view.c_str());
+                    _lcd.print(view.c_str());
                 }
-                xSemaphoreGive(car->_lcdMutex);
+                xSemaphoreGive(_lcdMutex);
             }
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-void Car::print_to_lcd(std::string str, int line) {
-    if (line < 0 || line >= LCD_LINES) return;
+static void init_lcd() {
+    _lcd.begin(LCD_COLS, LCD_LINES);
+    _lcdMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(lcd_task, "lcd_task", 2048, nullptr, 1, &_lcdTaskHandle, 0);
+}
 
+void print_to_lcd(std::string str, int line) {
+    if (line < 0 || line >= LCD_LINES) return;
     if (xSemaphoreTake(_lcdMutex, portMAX_DELAY)) {
-        _lineState[line].text = str;
-        _lineState[line].offset = 0;
+        _lineState[line].text      = str;
+        _lineState[line].offset    = 0;
         _lineState[line].lastScroll = millis();
 
-        // Render first frame immediately
         _lcd.setCursor(0, line);
         std::string view = str.substr(0, LCD_COLS);
         while ((int)view.size() < LCD_COLS) view += ' ';
@@ -110,75 +143,65 @@ void Car::print_to_lcd(std::string str, int line) {
     }
 }
 
-void Car::init_tof() {
-    // Shut down all sensors first
+// ----------------------------------------------------------------
+// TOF
+// ----------------------------------------------------------------
+static void init_tof() {
     for (int i = 0; i < 3; i++) {
         pinMode(TOF_XSHUT[i], OUTPUT);
         digitalWrite(TOF_XSHUT[i], LOW);
     }
     delay(10);
 
-    // Bring up each sensor one at a time and assign unique address
     for (int i = 0; i < 3; i++) {
         digitalWrite(TOF_XSHUT[i], HIGH);
         delay(100);
-
         if (!_tof[i].begin(TOF_IDS[i], &Wire)) {
-            // sensor i failed to init — handle error here
             Serial.printf("TOF %d failed\n", i);
         }
     }
 }
 
-std::array<float, 3> Car::get_tof_dist_mm() {
+std::array<float, 3> get_tof_dist_mm() {
     std::array<float, 3> distances;
-    
     for (int i = 0; i < 3; i++) {
         VL53L0X_RangingMeasurementData_t measure;
         _tof[i].rangingTest(&measure, false);
-        
-        if (measure.RangeStatus != 4) {  // status 4 = out of range/error
-            distances[i] = measure.RangeMilliMeter;
-        } else {
-            distances[i] = -1.0f;  // sentinel for invalid reading
-        }
+        distances[i] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1.0f;
     }
-    
     return distances;
 }
 
-void Car::init_ir(){
-    _irMutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(ir_task, "ir_task", 2048, this, 1, &_irTaskHandle, 0);
-}
-
-void Car::ir_task(void* pvParameters) {
-    Car* car = static_cast<Car*>(pvParameters);
-    std::array<int, 3> samples[3] = {};
+// ----------------------------------------------------------------
+// IR
+// ----------------------------------------------------------------
+static void ir_task(void* pvParameters) {
+    std::array<int, IR_SAMPLES> samples[3] = {};
     int idx = 0;
 
     for (;;) {
-        // Take one sample across all 3 sensors
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 3; i++)
             samples[i][idx] = analogRead(IR_PINS[i]);
-        }
-        idx = (idx + 1) % 3;  // ring buffer
+        idx = (idx + 1) % IR_SAMPLES;
 
-        // Compute averages and update shared state
-        if (xSemaphoreTake(car->_irMutex, 0)) {
+        if (xSemaphoreTake(_irMutex, 0)) {
             for (int i = 0; i < 3; i++) {
                 int sum = 0;
-                for (int j = 0; j < 3; j++) sum += samples[i][j];
-                car->_irValues[i] = sum / 3;
+                for (int j = 0; j < IR_SAMPLES; j++) sum += samples[i][j];
+                _irValues[i] = sum / IR_SAMPLES;
             }
-            xSemaphoreGive(car->_irMutex);
+            xSemaphoreGive(_irMutex);
         }
-
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
-std::array<int, 3> Car::get_IR_values() {
+static void init_ir() {
+    _irMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(ir_task, "ir_task", 2048, nullptr, 1, &_irTaskHandle, 0);
+}
+
+std::array<int, 3> get_IR_values() {
     std::array<int, 3> result;
     if (xSemaphoreTake(_irMutex, portMAX_DELAY)) {
         result = _irValues;
@@ -187,60 +210,65 @@ std::array<int, 3> Car::get_IR_values() {
     return result;
 }
 
-void Car::init_rgb() {
+// ----------------------------------------------------------------
+// RGB
+// ----------------------------------------------------------------
+static void init_rgb() {
+    _rgb = Adafruit_NeoPixel(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
     _rgb.begin();
-    _rgb.setBrightness(100);  // 0-255, 50 is a good default to avoid blinding
+    _rgb.setBrightness(100);
     _rgb.clear();
     _rgb.show();
 }
 
-void Car::set_rgb(int r, int g, int b) {
+void set_rgb(int r, int g, int b) {
     _rgb.setPixelColor(0, _rgb.Color(r, g, b));
     _rgb.show();
 }
 
-void Car::set_led_power(int power){
-    power = power >= 0 ? (power <= 255 ? power: 255): 0;
+void set_led_power(int power) {
+    power = constrain(power, 0, 255);
     _rgb.setBrightness(power);
     _rgb.show();
 }
 
-void Car::init_motors() {
-    // TODO: setup once driver is known
+// ----------------------------------------------------------------
+// Motors
+// ----------------------------------------------------------------
+static void init_motors() {
+    // TODO: implement once driver is known
 }
 
-void Car::set_r_speed(float spd) {
-    spd = constrain(spd, 0, 100);
-    _r_speed = (int)(spd / 100.0f * 255);
-    update_motors();
-}
-
-void Car::set_l_speed(float spd) {
-    spd = constrain(spd, 0, 100);
-    _l_speed = (int)(spd / 100.0f * 255);
-    update_motors();
-}
-
-void Car::set_r_dir(bool setReverse) {
-    _r_dir = setReverse;
-    update_motors();
-}
-
-void Car::set_l_dir(bool setReverse) {
-    _l_dir = setReverse;
-    update_motors();
-}
-
-void Car::stop(){
-    set_l_speed(0);
-    set_r_speed(0);
-}
-
-void Car::update_motors() {
+static void update_motors() {
     // TODO: implement once driver is known
     // L9110S example:
     //   digitalWrite(MTR_R_ONE, _r_dir);
     //   analogWrite(MTR_R_TWO, _r_speed);
     //   digitalWrite(MTR_L_ONE, _l_dir);
     //   analogWrite(MTR_L_TWO, _l_speed);
+}
+
+void set_r_speed(float spd) {
+    _r_speed = (int)(constrain(spd, 0, 100) / 100.0f * 255);
+    update_motors();
+}
+
+void set_l_speed(float spd) {
+    _l_speed = (int)(constrain(spd, 0, 100) / 100.0f * 255);
+    update_motors();
+}
+
+void set_r_dir(bool setReverse) {
+    _r_dir = setReverse;
+    update_motors();
+}
+
+void set_l_dir(bool setReverse) {
+    _l_dir = setReverse;
+    update_motors();
+}
+
+void stop() {
+    set_l_speed(0);
+    set_r_speed(0);
 }
