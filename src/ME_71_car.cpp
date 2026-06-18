@@ -1,42 +1,4 @@
-#include "ME_71_car.h"
-#include <Wire.h>
-#include "Adafruit_VL53L0X.h"
-#include <hd44780.h>
-#include <hd44780ioClass/hd44780_I2Cexp.h>
-
-// ----------------------------------------------------------------
-// Internal state (hidden from students)
-// ----------------------------------------------------------------
-
-// LCD
-static hd44780_I2Cexp  _lcd;
-static SemaphoreHandle_t _lcdMutex;
-static TaskHandle_t      _lcdTaskHandle;
-
-struct LineState {
-    std::string   text;
-    int           offset;
-    unsigned long lastScroll;
-};
-static LineState _lineState[LCD_LINES];
-
-// TOF
-static Adafruit_VL53L0X _tof[3];
-
-// IR
-static std::array<int, 3> _irValues;
-static SemaphoreHandle_t  _irMutex;
-static TaskHandle_t       _irTaskHandle;
-
-// RGB
-static Adafruit_NeoPixel _rgb;
-
-// Motors
-static int  _r_speed = 0;
-static int  _l_speed = 0;
-static bool _r_dir   = false;
-static bool _l_dir   = false;
-
+#include "ME71_Car.h"
 // ----------------------------------------------------------------
 // Forward declarations of internal helpers
 // ----------------------------------------------------------------
@@ -151,23 +113,48 @@ static void init_tof() {
         pinMode(TOF_XSHUT[i], OUTPUT);
         digitalWrite(TOF_XSHUT[i], LOW);
     }
-    delay(10);
+    delay(50);
 
     for (int i = 0; i < 3; i++) {
         digitalWrite(TOF_XSHUT[i], HIGH);
         delay(100);
-        if (!_tof[i].begin(TOF_IDS[i], &Wire)) {
-            Serial.printf("TOF %d failed\n", i);
+        
+        // Retry begin() until it succeeds
+        int attempts = 0;
+        while (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire)) && attempts++ < 5) {
+            delay(100);
         }
+        
+        Serial.printf("TOF %d: %s\n", i, _tof_ok[i] ? "OK" : "FAILED");
+        delay(200);  // give it time to settle before waking the next one
     }
 }
+// static void init_tof() {
+//     // Shut all down
+//     for (int i = 0; i < 3; i++) {
+//         pinMode(TOF_XSHUT[i], OUTPUT);
+//         digitalWrite(TOF_XSHUT[i], LOW);
+//     }
+//     delay(50);
 
-std::array<float, 3> get_tof_dist_mm() {
-    std::array<float, 3> distances;
+//     // Bring up only sensor 0 at default address
+//     digitalWrite(TOF_XSHUT[0], HIGH);
+//     delay(100);
+
+//     Serial.println("Calling begin...");
+//     bool ok = _tof[0].begin(0x29, true, &Wire);  // true enables debug prints
+//     Serial.print("Result: ");
+//     Serial.println(ok ? "OK" : "FAILED");
+
+//     // Leave sensors 1 and 2 in shutdown — don't init them yet
+// }
+
+std::array<int, 3> get_tof_dist_mm() {
+    std::array<int, 3> distances;
     for (int i = 0; i < 3; i++) {
         VL53L0X_RangingMeasurementData_t measure;
         _tof[i].rangingTest(&measure, false);
-        distances[i] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1.0f;
+        distances[i] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
     }
     return distances;
 }
@@ -236,16 +223,59 @@ void set_led_power(int power) {
 // Motors
 // ----------------------------------------------------------------
 static void init_motors() {
-    // TODO: implement once driver is known
+    pinMode(SR_SHCP, OUTPUT);
+    pinMode(SR_EN,   OUTPUT);
+    pinMode(SR_DATA, OUTPUT);
+    pinMode(SR_STCP, OUTPUT);
+
+    // Enable the shift register
+    digitalWrite(SR_EN, LOW);
+
+    // Set up LEDC PWM for both sides
+    ledcSetup(MTR_L_LEDC_CH, MTR_PWM_FREQ, MTR_PWM_RES);
+    ledcSetup(MTR_R_LEDC_CH, MTR_PWM_FREQ, MTR_PWM_RES);
+    ledcAttachPin(MTR_PWM_L, MTR_L_LEDC_CH);
+    ledcAttachPin(MTR_PWM_R, MTR_R_LEDC_CH);
+
+    // Start stopped
+    ledcWrite(MTR_L_LEDC_CH, 0);
+    ledcWrite(MTR_R_LEDC_CH, 0);
+
+    // Latch a zeroed direction byte
+    digitalWrite(SR_STCP, LOW);
+    shiftOut(SR_DATA, SR_SHCP, MSBFIRST, DIR_STOP);
+    digitalWrite(SR_STCP, HIGH);
+}
+
+// Write a direction byte to the shift register
+static void sr_write(uint8_t dirByte) {
+    digitalWrite(SR_STCP, LOW);
+    shiftOut(SR_DATA, SR_SHCP, MSBFIRST, dirByte);
+    digitalWrite(SR_STCP, HIGH);
 }
 
 static void update_motors() {
-    // TODO: implement once driver is known
-    // L9110S example:
-    //   digitalWrite(MTR_R_ONE, _r_dir);
-    //   analogWrite(MTR_R_TWO, _r_speed);
-    //   digitalWrite(MTR_L_ONE, _l_dir);
-    //   analogWrite(MTR_L_TWO, _l_speed);
+    // Determine direction byte from left/right dir flags
+    uint8_t dirByte;
+
+    bool stopped = (_l_speed == 0 && _r_speed == 0);
+
+    if (stopped) {
+        dirByte = DIR_STOP;
+    } else if (!_l_dir && !_r_dir) {
+        dirByte = DIR_FORWARD;
+    } else if (_l_dir && _r_dir) {
+        dirByte = DIR_BACKWARD;
+    } else if (_l_dir && !_r_dir) {
+        dirByte = DIR_TURN_L;   // left back, right fwd = turn left
+    } else {
+        dirByte = DIR_TURN_R;   // left fwd, right back = turn right
+    }
+
+    sr_write(dirByte);
+
+    ledcWrite(MTR_L_LEDC_CH, _l_speed);
+    ledcWrite(MTR_R_LEDC_CH, _r_speed);
 }
 
 void set_r_speed(float spd) {
@@ -272,3 +302,5 @@ void stop() {
     set_l_speed(0);
     set_r_speed(0);
 }
+
+
