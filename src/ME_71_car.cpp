@@ -1,4 +1,6 @@
+
 #include "ME_71_car.h"
+#include "vehicle.h"
 // ----------------------------------------------------------------
 // Forward declarations of internal helpers
 // ----------------------------------------------------------------
@@ -7,20 +9,18 @@ static void init_tof();
 static void init_ir();
 static void init_rgb();
 static void init_motors();
-static void update_motors();
+
 static void lcd_task(void* pvParameters);
 static void ir_task(void* pvParameters);
+static void sr_write(uint8_t dirByte);
+
+vehicle vh;
 
 // ----------------------------------------------------------------
 // Public: car_init
 // ----------------------------------------------------------------
 void car_init() {
     Serial.begin(115200);
-
-    pinMode(MTR_R_ONE, OUTPUT);
-    pinMode(MTR_R_TWO, OUTPUT);
-    pinMode(MTR_L_ONE, OUTPUT);
-    pinMode(MTR_L_TWO, OUTPUT);
 
     pinMode(IR_PINS[0], INPUT);
     pinMode(IR_PINS[1], INPUT);
@@ -31,13 +31,15 @@ void car_init() {
     pinMode(TOF_XSHUT[2], OUTPUT);
 
     Wire.begin(I2C_SDA, I2C_SCL);
+	Wire2.begin(14, 13);
+	Wire2.setClock(100000);
     delay(100);
 
     init_lcd();
     delay(100);
     print_to_lcd("LCD Initialized", 0);
 
-    init_tof();
+	init_tof();
     print_to_lcd("TOF Initialized", 0);
     delay(100);
 
@@ -57,29 +59,66 @@ void car_init() {
 // ----------------------------------------------------------------
 // LCD
 // ----------------------------------------------------------------
+static std::string        _pendingText[LCD_LINES];
+
 static void lcd_task(void* pvParameters) {
+    unsigned long lastUpdate[LCD_LINES] = {};
     for (;;) {
         unsigned long now = millis();
         for (int line = 0; line < LCD_LINES; line++) {
             if (xSemaphoreTake(_lcdMutex, 0)) {
                 LineState& ls = _lineState[line];
-                if ((int)ls.text.size() > LCD_COLS &&
+
+                bool dwellActive = ls.dwelling && (now - ls.dwellStart < 400);
+
+                if (!dwellActive && now - lastUpdate[line] >= 1000) {
+                    if (_pendingText[line] != ls.text) {
+                        ls.text       = _pendingText[line];
+                        ls.offset     = 0;
+                        ls.lastScroll = now;
+                        ls.dwelling   = false;
+                        _lcd.setCursor(0, line);
+                        std::string view = ls.text.substr(0, LCD_COLS);
+                        while ((int)view.size() < LCD_COLS) view += ' ';
+                        _lcd.print(view.c_str());
+                    }
+                    lastUpdate[line] = now;
+                }
+
+                if (!dwellActive && (int)ls.text.size() > LCD_COLS &&
                     now - ls.lastScroll >= SCROLL_DELAY_MS) {
+                    
+                    if (ls.offset >= (int)ls.text.size() - LCD_COLS) {
+                        // reached the end, start dwell
+                        ls.dwelling   = true;
+                        ls.dwellStart = now;
+                        ls.offset     = 0;
+                    } else {
+                        ls.lastScroll = now;
+                        ls.offset++;
+                    }
 
-                    ls.lastScroll = now;
-                    ls.offset++;
-                    if (ls.offset > (int)ls.text.size() - LCD_COLS)
-                        ls.offset = 0;
+                    if (!ls.dwelling) {
+                        _lcd.setCursor(0, line);
+                        std::string view = ls.text.substr(ls.offset, LCD_COLS);
+                        while ((int)view.size() < LCD_COLS) view += ' ';
+                        _lcd.print(view.c_str());
+                    }
+                }
 
+                if (ls.dwelling && !dwellActive) {
+                    ls.dwelling = false;
+                    // render from offset 0
                     _lcd.setCursor(0, line);
-                    std::string view = ls.text.substr(ls.offset, LCD_COLS);
+                    std::string view = ls.text.substr(0, LCD_COLS);
                     while ((int)view.size() < LCD_COLS) view += ' ';
                     _lcd.print(view.c_str());
                 }
+
                 xSemaphoreGive(_lcdMutex);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -92,15 +131,7 @@ static void init_lcd() {
 void print_to_lcd(std::string str, int line) {
     if (line < 0 || line >= LCD_LINES) return;
     if (xSemaphoreTake(_lcdMutex, portMAX_DELAY)) {
-        _lineState[line].text      = str;
-        _lineState[line].offset    = 0;
-        _lineState[line].lastScroll = millis();
-
-        _lcd.setCursor(0, line);
-        std::string view = str.substr(0, LCD_COLS);
-        while ((int)view.size() < LCD_COLS) view += ' ';
-        _lcd.print(view.c_str());
-
+        _pendingText[line] = str;
         xSemaphoreGive(_lcdMutex);
     }
 }
@@ -114,48 +145,44 @@ static void init_tof() {
         digitalWrite(TOF_XSHUT[i], LOW);
     }
     delay(50);
+	int i = 0;
+	digitalWrite(TOF_XSHUT[i], HIGH);
+	delay(100);
+	
+	if (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire2))) {
+		delay(100);
+	}
+	
+	Serial.printf("TOF %d: %s\n", i, _tof_ok[i] ? "OK" : "FAILED");
+	delay(200);
 
-    for (int i = 0; i < 3; i++) {
+   /*  for (int i = 0; i < 3; i++) {
         digitalWrite(TOF_XSHUT[i], HIGH);
         delay(100);
         
-        // Retry begin() until it succeeds
-        int attempts = 0;
-        while (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire)) && attempts++ < 5) {
+        if (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire2))) {
             delay(100);
         }
         
         Serial.printf("TOF %d: %s\n", i, _tof_ok[i] ? "OK" : "FAILED");
         delay(200);  // give it time to settle before waking the next one
-    }
+    } */
 }
-// static void init_tof() {
-//     // Shut all down
-//     for (int i = 0; i < 3; i++) {
-//         pinMode(TOF_XSHUT[i], OUTPUT);
-//         digitalWrite(TOF_XSHUT[i], LOW);
-//     }
-//     delay(50);
 
-//     // Bring up only sensor 0 at default address
-//     digitalWrite(TOF_XSHUT[0], HIGH);
-//     delay(100);
-
-//     Serial.println("Calling begin...");
-//     bool ok = _tof[0].begin(0x29, true, &Wire);  // true enables debug prints
-//     Serial.print("Result: ");
-//     Serial.println(ok ? "OK" : "FAILED");
-
-//     // Leave sensors 1 and 2 in shutdown — don't init them yet
-// }
-
-std::array<int, 3> get_tof_dist_mm() {
+/* std::array<int, 3> get_tof_dist_mm() {
     std::array<int, 3> distances;
     for (int i = 0; i < 3; i++) {
         VL53L0X_RangingMeasurementData_t measure;
         _tof[i].rangingTest(&measure, false);
         distances[i] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
     }
+    return distances;
+} */
+std::array<int, 3> get_tof_dist_mm() {
+    std::array<int, 3> distances = {-1, -1, -1};
+    VL53L0X_RangingMeasurementData_t measure;
+    _tof[0].rangingTest(&measure, false);
+    distances[0] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
     return distances;
 }
 
@@ -201,7 +228,6 @@ std::array<int, 3> get_IR_values() {
 // RGB
 // ----------------------------------------------------------------
 static void init_rgb() {
-    _rgb = Adafruit_NeoPixel(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
     _rgb.begin();
     _rgb.setBrightness(100);
     _rgb.clear();
@@ -223,35 +249,14 @@ void set_led_power(int power) {
 // Motors
 // ----------------------------------------------------------------
 static void init_motors() {
-    pinMode(SR_SHCP, OUTPUT);
-    pinMode(SR_EN,   OUTPUT);
-    pinMode(SR_DATA, OUTPUT);
-    pinMode(SR_STCP, OUTPUT);
-
-    // Enable the shift register
-    digitalWrite(SR_EN, LOW);
-
-    // Set up LEDC PWM for both sides
-    ledcSetup(MTR_L_LEDC_CH, MTR_PWM_FREQ, MTR_PWM_RES);
-    ledcSetup(MTR_R_LEDC_CH, MTR_PWM_FREQ, MTR_PWM_RES);
-    ledcAttachPin(MTR_PWM_L, MTR_L_LEDC_CH);
-    ledcAttachPin(MTR_PWM_R, MTR_R_LEDC_CH);
-
-    // Start stopped
-    ledcWrite(MTR_L_LEDC_CH, 0);
-    ledcWrite(MTR_R_LEDC_CH, 0);
-
-    // Latch a zeroed direction byte
-    digitalWrite(SR_STCP, LOW);
-    shiftOut(SR_DATA, SR_SHCP, MSBFIRST, DIR_STOP);
-    digitalWrite(SR_STCP, HIGH);
+    vh.Init();
 }
 
 // Write a direction byte to the shift register
 static void sr_write(uint8_t dirByte) {
-    digitalWrite(SR_STCP, LOW);
-    shiftOut(SR_DATA, SR_SHCP, MSBFIRST, dirByte);
-    digitalWrite(SR_STCP, HIGH);
+    digitalWrite(STCP_PIN, LOW);
+    shiftOut(DATA_PIN, SHCP_PIN, MSBFIRST, dirByte);
+    digitalWrite(STCP_PIN, HIGH);
 }
 
 static void update_motors() {
@@ -259,32 +264,43 @@ static void update_motors() {
     uint8_t dirByte;
 
     bool stopped = (_l_speed == 0 && _r_speed == 0);
+	int l_forward = M1_Forward + M2_Forward;
+	int r_forward = M3_Forward + M4_Forward;
+	
+	int l_reverse = M1_Backward + M2_Backward;
+	int r_reverse = M3_Backward + M4_Backward;
+	
+	
+	uint8_t r_dir = (!_r_dir) ? r_forward : r_reverse;
+	uint8_t l_dir = (!_l_dir) ? l_forward : l_reverse;
+	
+	dirByte = r_dir | l_dir;
 
     if (stopped) {
-        dirByte = DIR_STOP;
-    } else if (!_l_dir && !_r_dir) {
-        dirByte = DIR_FORWARD;
-    } else if (_l_dir && _r_dir) {
-        dirByte = DIR_BACKWARD;
-    } else if (_l_dir && !_r_dir) {
-        dirByte = DIR_TURN_L;   // left back, right fwd = turn left
-    } else {
-        dirByte = DIR_TURN_R;   // left fwd, right back = turn right
-    }
-
-    sr_write(dirByte);
-
-    ledcWrite(MTR_L_LEDC_CH, _l_speed);
-    ledcWrite(MTR_R_LEDC_CH, _r_speed);
+		_l_speed = 0;
+		_r_speed = 0;
+		dirByte = MTRS_STOP;
+	}
+	
+	vh.Move(dirByte, _l_speed, _r_speed);
 }
 
 void set_r_speed(float spd) {
-    _r_speed = (int)(constrain(spd, 0, 100) / 100.0f * 255);
+	spd = constrain(spd, 0, 100);
+	spd = map(spd, 0, 100, 50, 100);
+	if (spd < 52.5) spd = 0;
+	
+    _r_speed = (int)(( spd/ 100.0f) * (256 -1));
     update_motors();
 }
 
 void set_l_speed(float spd) {
-    _l_speed = (int)(constrain(spd, 0, 100) / 100.0f * 255);
+	spd = constrain(spd, 0, 100);
+	spd = map(spd, 0, 100, 50, 100);
+	if (spd < 52.5) spd = 0;
+	
+	
+    _l_speed = (int)((spd / 100.0f) * (256 -1));
     update_motors();
 }
 
