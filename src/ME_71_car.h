@@ -34,10 +34,9 @@ static TwoWire Wire2(1);
 
 
 constexpr int IR_PINS[3]   = {35, 36, 39};
-constexpr int TOF_XSHUT[3] = {2, 26, 27};
-constexpr uint8_t TOF_IDS[3] = {0x30, 0x31, 0x32};
+static int TOF_XSHUT = 12;
 
-static bool _tof_ok[3] = {false, false, false};
+static bool _tof_ok = false;
 
 // LCD / task constants
 constexpr int          LCD_COLS        = 16;
@@ -61,7 +60,7 @@ static LineState _lineState[LCD_LINES];
 
 
 // TOF
-static Adafruit_VL53L0X _tof[3];
+static Adafruit_VL53L0X _tof;
 
 // IR
 static std::array<int, 3> _irValues;
@@ -81,7 +80,7 @@ static bool _l_dir   = false;
 void car_init();
 
 // Sensors
-std::array<int, 3> get_tof_dist_mm();
+int get_tof_dist_mm();
 std::array<int, 3>   get_IR_values();
 
 // LCD

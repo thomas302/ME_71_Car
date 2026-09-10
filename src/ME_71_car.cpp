@@ -26,9 +26,7 @@ void car_init() {
     pinMode(IR_PINS[1], INPUT);
     pinMode(IR_PINS[2], INPUT);
 
-    pinMode(TOF_XSHUT[0], OUTPUT);
-    pinMode(TOF_XSHUT[1], OUTPUT);
-    pinMode(TOF_XSHUT[2], OUTPUT);
+    pinMode(TOF_XSHUT, OUTPUT);
 
     Wire.begin(I2C_SDA, I2C_SCL);
 	Wire2.begin(14, 13);
@@ -140,52 +138,26 @@ void print_to_lcd(std::string str, int line) {
 // TOF
 // ----------------------------------------------------------------
 static void init_tof() {
-    for (int i = 0; i < 3; i++) {
-        pinMode(TOF_XSHUT[i], OUTPUT);
-        digitalWrite(TOF_XSHUT[i], LOW);
-    }
+	pinMode(TOF_XSHUT, OUTPUT);
+	digitalWrite(TOF_XSHUT, LOW);
     delay(50);
 	int i = 0;
-	digitalWrite(TOF_XSHUT[i], HIGH);
+	digitalWrite(TOF_XSHUT, HIGH);
 	delay(100);
 	
-	if (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire2))) {
-		delay(100);
-	}
+	_tof_ok = _tof.begin(0x29, false, &Wire2);
 	
-	Serial.printf("TOF %d: %s\n", i, _tof_ok[i] ? "OK" : "FAILED");
+	Serial.printf("TOF %d: %s\n", i, _tof_ok ? "OK" : "FAILED");
 	delay(200);
-
-   /*  for (int i = 0; i < 3; i++) {
-        digitalWrite(TOF_XSHUT[i], HIGH);
-        delay(100);
-        
-        if (!(_tof_ok[i] = _tof[i].begin(TOF_IDS[i], false, &Wire2))) {
-            delay(100);
-        }
-        
-        Serial.printf("TOF %d: %s\n", i, _tof_ok[i] ? "OK" : "FAILED");
-        delay(200);  // give it time to settle before waking the next one
-    } */
 }
 
-/* std::array<int, 3> get_tof_dist_mm() {
-    std::array<int, 3> distances;
-    for (int i = 0; i < 3; i++) {
+int get_tof_dist_mm() {
+    if (_tof_ok) {
         VL53L0X_RangingMeasurementData_t measure;
-        _tof[i].rangingTest(&measure, false);
-        distances[i] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
+        _tof.rangingTest(&measure, false);
+        return (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
     }
-    return distances;
-} */
-std::array<int, 3> get_tof_dist_mm() {
-    std::array<int, 3> distances = {-1, -1, -1};
-    if (_tof_ok[0]) {
-        VL53L0X_RangingMeasurementData_t measure;
-        _tof[0].rangingTest(&measure, false);
-        distances[0] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
-    }
-    return distances;
+	return 0;
 }
 
 // ----------------------------------------------------------------
