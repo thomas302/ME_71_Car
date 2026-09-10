@@ -1,11 +1,12 @@
 #include <Wire.h>
 static TwoWire Wire2(1);
+
 #include <array>
 #include <string>
-#include <hd44780.h>
-#include <hd44780ioClass/hd44780_I2Cexp.h>
-#include "Adafruit_VL53L0X.h"
-#include <Adafruit_NeoPixel.h>
+#include "hd44780/hd44780.h"
+#include "hd44780/hd44780ioClass/hd44780_I2Cexp.h"
+#include "Adafruit_VL53L0X/src/Adafruit_VL53L0X.h"
+#include "Adafruit_NeoPixel/Adafruit_NeoPixel.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -33,7 +34,7 @@ static TwoWire Wire2(1);
 
 
 constexpr int IR_PINS[3]   = {35, 36, 39};
-constexpr int TOF_XSHUT[3] = {25, 26, 27};
+constexpr int TOF_XSHUT[3] = {2, 26, 27};
 constexpr uint8_t TOF_IDS[3] = {0x30, 0x31, 0x32};
 
 static bool _tof_ok[3] = {false, false, false};

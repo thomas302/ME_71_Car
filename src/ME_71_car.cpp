@@ -180,9 +180,11 @@ static void init_tof() {
 } */
 std::array<int, 3> get_tof_dist_mm() {
     std::array<int, 3> distances = {-1, -1, -1};
-    VL53L0X_RangingMeasurementData_t measure;
-    _tof[0].rangingTest(&measure, false);
-    distances[0] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
+    if (_tof_ok[0]) {
+        VL53L0X_RangingMeasurementData_t measure;
+        _tof[0].rangingTest(&measure, false);
+        distances[0] = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
+    }
     return distances;
 }
 
