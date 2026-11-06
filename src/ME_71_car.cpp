@@ -1,6 +1,8 @@
 
 #include "ME_71_car.h"
 #include "vehicle.h"
+Preferences prefs;
+
 // ----------------------------------------------------------------
 // Forward declarations of internal helpers
 // ----------------------------------------------------------------
@@ -16,11 +18,31 @@ static void sr_write(uint8_t dirByte);
 
 vehicle vh;
 
+Adafruit_VL53L0X create_tof_sensor() {
+    Adafruit_VL53L0X tof;
+
+    Wire2.begin(14, 13);
+    // Wire2.setClock(100000);
+
+    tof.begin(
+        0x29,
+        false,
+        &Wire2,
+        Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_ACCURACY
+    );
+
+    return tof;
+}
+
 // ----------------------------------------------------------------
 // Public: car_init
 // ----------------------------------------------------------------
 void car_init() {
     Serial.begin(115200);
+
+    analogSetPinAttenuation(IR_PINS[0], ADC_11db);
+    analogSetPinAttenuation(IR_PINS[1], ADC_11db);
+    analogSetPinAttenuation(IR_PINS[2], ADC_11db);
 
     pinMode(IR_PINS[0], INPUT);
     pinMode(IR_PINS[1], INPUT);
@@ -137,6 +159,8 @@ void print_to_lcd(std::string str, int line) {
 // ----------------------------------------------------------------
 // TOF
 // ----------------------------------------------------------------
+
+int offset = 0;
 static void init_tof() {
 	pinMode(TOF_XSHUT, OUTPUT);
 	digitalWrite(TOF_XSHUT, LOW);
@@ -145,19 +169,32 @@ static void init_tof() {
 	digitalWrite(TOF_XSHUT, HIGH);
 	delay(100);
 	
-	_tof_ok = _tof.begin(0x29, false, &Wire2);
+	prefs.begin("TOF", false);
+	offset = prefs.getShort("offset", 0);
+	prefs.end();
+	
+	_tof_ok = _tof.begin(0x29, false, &Wire2, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_ACCURACY);
 	
 	Serial.printf("TOF %d: %s\n", i, _tof_ok ? "OK" : "FAILED");
 	delay(200);
 }
 
-int get_tof_dist_mm() {
-    if (_tof_ok) {
-        VL53L0X_RangingMeasurementData_t measure;
-        _tof.rangingTest(&measure, false);
-        return (measure.RangeStatus != 4) ? measure.RangeMilliMeter : -1;
+static int last_val = -1;     // last good corrected reading, -1 until the first one
+
+int get_tof_dist_mm(bool calibration) {
+    if (!_tof_ok) return -1;
+
+    VL53L0X_RangingMeasurementData_t measure;
+    _tof.rangingTest(&measure, false);
+	int raw = measure.RangeMilliMeter;
+    bool ok = (measure.RangeStatus == 0) && raw > 5 && raw < 2000;
+
+    if (calibration) {
+        return ok ? raw : -1;   // raw value, no offset, no held value
     }
-	return 0;
+
+    if (ok) last_val = raw + offset;
+    return last_val;                                // bad read -> last good value
 }
 
 // ----------------------------------------------------------------
@@ -168,8 +205,7 @@ static void ir_task(void* pvParameters) {
     int idx = 0;
 
     for (;;) {
-        for (int i = 0; i < 3; i++)
-            samples[i][idx] = analogRead(IR_PINS[i]);
+        for (int i = 0; i < 3; i++) samples[i][idx] = analogRead(IR_PINS[i]);
         idx = (idx + 1) % IR_SAMPLES;
 
         if (xSemaphoreTake(_irMutex, 0)) {
@@ -183,8 +219,23 @@ static void ir_task(void* pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
+int map_clip(int in, int imin = 0, int imax = 4096, int omin = 0, int omax = 1000) {
+  int mapped = map(in, imin, imax, omin, omax);
+  return max(min(omin, omax), min(max(omin, omax), mapped));
+}
 
+int imin[3] = {0,0,0};
 static void init_ir() {
+	
+	prefs.begin("IR", false);
+	imin[0] = prefs.getShort("L_WHITE");
+	imin[1] = prefs.getShort("M_WHITE");
+	imin[2] = prefs.getShort("R_WHITE");
+	prefs.end();
+	pinMode(35, INPUT);
+	pinMode(36, INPUT);
+	pinMode(39, INPUT);
+	
     _irMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(ir_task, "ir_task", 2048, nullptr, 1, &_irTaskHandle, 0);
 }
@@ -193,6 +244,9 @@ std::array<int, 3> get_IR_values() {
     std::array<int, 3> result;
     if (xSemaphoreTake(_irMutex, portMAX_DELAY)) {
         result = _irValues;
+		result[0] = map_clip(result[0], imin[0]); 
+		result[1] = map_clip(result[1], imin[1]); 
+		result[2] = map_clip(result[2], imin[2]); 
         xSemaphoreGive(_irMutex);
     }
     return result;
@@ -278,12 +332,12 @@ void set_l_speed(float spd) {
     update_motors();
 }
 
-void set_r_dir(bool setReverse) {
+void set_r_reverse(bool setReverse) {
     _r_dir = setReverse;
     update_motors();
 }
 
-void set_l_dir(bool setReverse) {
+void set_l_reverse(bool setReverse) {
     _l_dir = setReverse;
     update_motors();
 }

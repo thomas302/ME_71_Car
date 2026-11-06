@@ -1,5 +1,8 @@
 #include <Wire.h>
+#include <Preferences.h>
 static TwoWire Wire2(1);
+
+extern Preferences prefs; 
 
 #include <array>
 #include <string>
@@ -79,8 +82,10 @@ static bool _l_dir   = false;
 // --- Public API (no class needed — one car, always) ---
 void car_init();
 
+Adafruit_VL53L0X create_tof_sensor();
+
 // Sensors
-int get_tof_dist_mm();
+int get_tof_dist_mm(bool calibration = false);
 std::array<int, 3>   get_IR_values();
 
 // LCD
@@ -93,6 +98,6 @@ void set_led_power(int power);
 // Motors
 void set_r_speed(float spd);
 void set_l_speed(float spd);
-void set_r_dir(bool setReverse);
-void set_l_dir(bool setReverse);
+void set_r_reverse(bool setReverse);
+void set_l_reverse(bool setReverse);
 void stop();
